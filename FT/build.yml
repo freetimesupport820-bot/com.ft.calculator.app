@@ -1,0 +1,361 @@
+# F T - CREATE QR & SCANNING  -  Godot 4.7.2 native Android build (APK + AAB), arm64 only.
+# Place this file at: .github/workflows/build.yml   (all other files go into the FT/ folder in the repo root)
+name: Build Android (APK + AAB)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+env:
+  GODOT_VERSION: "4.7.2"
+  GODOT_TAG: "4.7.2-stable"
+  APP_NAME: "F T - CREATE QR & SCANNING"
+  PACKAGE_NAME: "com.ft.create.qr.and.scanning.app"
+  VERSION_CODE: "1"
+  VERSION_NAME: "1.0.0"
+  SECURITY_MODE: "TEST"
+  ANDROID_NDK_VERSION: "29.0.14206865"
+  ANDROID_BUILD_TOOLS: "36.1.0"
+  ANDROID_PLATFORM: "36"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1: custom arm64 release export template (script-encryption key compiled in). Cached.
+  # ---------------------------------------------------------------------------
+  template:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check encryption secret
+        env:
+          KEY: ${{ secrets.SCRIPT_AES256_ENCRYPTION_KEY }}
+        run: |
+          if ! printf '%s' "$KEY" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+            echo "::error::Secret SCRIPT_AES256_ENCRYPTION_KEY is missing or not 64 hex chars. Create it with: openssl rand -hex 32"
+            exit 1
+          fi
+          # Only a one-way hash of the key is used for the cache name (never the key itself).
+          printf '%s' "$KEY" | sha256sum | cut -c1-16 > "$RUNNER_TEMP/khash"
+          echo "KHASH=$(cat "$RUNNER_TEMP/khash")" >> "$GITHUB_ENV"
+
+      - name: Restore template cache
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: ~/ft-template
+          key: godot-template-${{ env.GODOT_TAG }}-arm64-r1-${{ env.KHASH }}
+
+      - uses: actions/setup-java@v6
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          packages: "platform-tools platforms;android-${{ env.ANDROID_PLATFORM }} build-tools;${{ env.ANDROID_BUILD_TOOLS }} ndk;${{ env.ANDROID_NDK_VERSION }}"
+
+      - name: Build custom template (arm64, release, encrypted)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SCRIPT_AES256_ENCRYPTION_KEY: ${{ secrets.SCRIPT_AES256_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          pip install --user scons
+          export PATH="$HOME/.local/bin:$PATH"
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          git clone --depth 1 --branch "$GODOT_TAG" https://github.com/godotengine/godot.git "$RUNNER_TEMP/godot"
+          cd "$RUNNER_TEMP/godot"
+          scons platform=android target=template_release arch=arm64 \
+            production=yes vulkan=no disable_3d=yes debug_symbols=no \
+            generate_android_binaries=yes -j"$(nproc)"
+          mkdir -p ~/ft-template
+          cp bin/android_source.zip ~/ft-template/android_source.zip
+          ls -la ~/ft-template
+
+      - name: Verify template
+        run: |
+          test -s ~/ft-template/android_source.zip || { echo "::error::android_source.zip missing"; exit 1; }
+          unzip -l ~/ft-template/android_source.zip | grep -q "libs/release/godot-lib" || { echo "::error::custom AAR not inside android_source.zip"; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: organise files, export signed APK + AAB, write the 8-file output.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: template
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      # ---- Auto-organise: FT/ folder -> project layout (manifest.txt has priority) ----
+      - name: Organise FT/ into project folders
+        run: |
+          set -uo pipefail
+          if [ -d FT ]; then
+            echo "FT/ folder found - organising files"
+            WARN=0
+            place() { # $1 = source file in FT/, $2 = destination (file path or dir/)
+              local src="FT/$1" dst="$2"
+              if [ ! -f "$src" ]; then echo "::warning::manifest lists missing file: $1"; return; fi
+              case "$dst" in
+                */) mkdir -p "$dst"
+                    case "$1" in
+                      *.zip) unzip -q -o "$src" -d "$dst" ;;
+                      *) mv -f "$src" "$dst$(basename "$1")" ;;
+                    esac ;;
+                *) mkdir -p "$(dirname "$dst")"; mv -f "$src" "$dst" ;;
+              esac
+            }
+            # 1) manifest.txt  (format:  file_name => destination   ; '#' = comment ; dest ending with / = folder)
+            if [ -f FT/manifest.txt ]; then
+              while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                case "$line" in ''|'#'*) continue ;; esac
+                src="$(printf '%s' "${line%%=>*}" | sed 's/[[:space:]]*$//;s/^[[:space:]]*//')"
+                dst="$(printf '%s' "${line#*=>}" | sed 's/[[:space:]]*$//;s/^[[:space:]]*//')"
+                [ -n "$src" ] && [ -n "$dst" ] && [ "$src" != "$line" ] && place "$src" "$dst"
+              done < FT/manifest.txt
+            fi
+            # 2) extension / name rules for anything the manifest did not place
+            for f in FT/*; do
+              [ -f "$f" ] || continue
+              b="$(basename "$f")"
+              case "$b" in
+                manifest.txt) continue ;;
+                project.godot|export_presets.cfg|privacy_policy.html|google-services.json) place "$b" "$b" ;;
+                GameState.gd|I18n.gd|AdController.gd) place "$b" "autoload/$b" ;;
+                *.gd) place "$b" "scripts/$b" ;;
+                *.tscn|*.scn) place "$b" "scenes/$b" ;;
+                *.gdshader) place "$b" "shaders/$b" ;;
+                *.ttf|*.otf) place "$b" "assets/fonts/$b" ;;
+                *.svg) place "$b" "assets/icons/$b" ;;
+                *.ogg|*.wav|*.mp3) place "$b" "assets/audio/$b" ;;
+                icon.png) place "$b" "assets/icon.png" ;;
+                *.png|*.jpg|*.webp) place "$b" "assets/$b" ;;
+                *.txt) place "$b" "ci/$b" ;;
+                *) echo "::warning::unknown file left in FT/: $b"; WARN=$((WARN+1)) ;;
+              esac
+            done
+            : > FT/.gdignore
+            [ -d FT/functions ] && { mkdir -p functions; cp -r FT/functions/. functions/; }
+            echo "organise done (warnings: $WARN)"
+          else
+            echo "No FT/ folder - assuming files are already in project layout"
+          fi
+          # ---- required files ----
+          MAIN="$(grep -E '^run/main_scene=' project.godot 2>/dev/null | sed -E 's/.*"res:\/\/([^"]+)".*/\1/')"
+          [ -f project.godot ] || { echo "::error::project.godot is missing"; exit 1; }
+          [ -n "$MAIN" ] && [ -f "$MAIN" ] || { echo "::error::main scene '$MAIN' is missing (expected scenes/Main.tscn)"; exit 1; }
+          [ -f export_presets.cfg ] || { echo "::error::export_presets.cfg is missing"; exit 1; }
+          [ -d addons/admob ] || { echo "::error::addons/admob (AdMob plugin) is missing"; exit 1; }
+          [ -f assets/icon.png ] || { echo "::warning::assets/icon.png missing - generating fallback icon"; mkdir -p assets; python3 - <<'PY'
+          import struct, zlib
+          S = 512
+          rows = b"".join(b"\x00" + bytes([6, 182, 212, 255]) * S for _ in range(S))
+          def chunk(t, d):
+              c = struct.pack(">I", len(d)) + t + d
+              return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+          png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", S, S, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+          open("assets/icon.png", "wb").write(png)
+          PY
+          }
+          find . -path ./.git -prune -o -type f -not -path './addons/*' -print | sort | head -80
+
+      - name: Optional AdMob ID override from secrets
+        env:
+          ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
+          ADMOB_BANNER_ID: ${{ secrets.ADMOB_BANNER_ID }}
+          ADMOB_INTERSTITIAL_ID: ${{ secrets.ADMOB_INTERSTITIAL_ID }}
+        run: |
+          if [ -n "$ADMOB_APP_ID" ]; then
+            sed -i "s|ca-app-pub-3940256099942544~3347511713|$ADMOB_APP_ID|" project.godot
+          fi
+          if [ -n "$ADMOB_BANNER_ID" ]; then
+            sed -i "s|ca-app-pub-3940256099942544/6300978111|$ADMOB_BANNER_ID|" scripts/app_config.gd
+          fi
+          if [ -n "$ADMOB_INTERSTITIAL_ID" ]; then
+            sed -i "s|ca-app-pub-3940256099942544/1033173712|$ADMOB_INTERSTITIAL_ID|" scripts/app_config.gd
+          fi
+          if [ "$SECURITY_MODE" != "TEST" ]; then
+            sed -i 's/SECURITY_MODE := "TEST"/SECURITY_MODE := "PLAY_STORE"/;s/SECURITY_CHECKS_ENABLED := false/SECURITY_CHECKS_ENABLED := true/' scripts/app_config.gd
+          fi
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-${{ env.ANDROID_PLATFORM }} build-tools;${{ env.ANDROID_BUILD_TOOLS }} ndk;${{ env.ANDROID_NDK_VERSION }}"
+
+      - name: Restore custom template
+        env:
+          KEY: ${{ secrets.SCRIPT_AES256_ENCRYPTION_KEY }}
+        run: |
+          printf '%s' "$KEY" | grep -Eq '^[0-9a-fA-F]{64}$' || { echo "::error::SCRIPT_AES256_ENCRYPTION_KEY secret missing/invalid"; exit 1; }
+          echo "KHASH=$(printf '%s' "$KEY" | sha256sum | cut -c1-16)" >> "$GITHUB_ENV"
+
+      - name: Load template cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/ft-template
+          key: godot-template-${{ env.GODOT_TAG }}-arm64-r1-${{ env.KHASH }}
+          fail-on-cache-miss: true
+
+      - name: Install Godot editor
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/godot.zip" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_TAG}/Godot_v${GODOT_TAG}_linux.x86_64.zip"
+          unzip -q "$RUNNER_TEMP/godot.zip" -d "$RUNNER_TEMP/godot-bin"
+          sudo mv "$RUNNER_TEMP/godot-bin/Godot_v${GODOT_TAG}_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          godot --version
+          mkdir -p ~/.config/godot
+          cat > ~/.config/godot/editor_settings-4.7.tres <<EOS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          EOS
+
+      - name: Install Android build template (custom, encrypted-key build)
+        run: |
+          set -euo pipefail
+          mkdir -p android/build
+          unzip -q -o ~/ft-template/android_source.zip -d android/build
+          godot --version | cut -d. -f1-4 > android/.build_version
+          : > android/build/.gdignore
+          chmod +x android/build/gradlew
+          cat android/.build_version
+
+      - name: Prepare signing key (existing secrets, or NEW key for First Build)
+        env:
+          S_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p out build
+          if [ -n "$S_B64" ] && [ -n "$S_PASS" ] && [ -n "$S_ALIAS" ]; then
+            echo "Using existing keystore from secrets"
+            printf '%s' "$S_B64" | base64 -d > out/release.jks
+            KS_PASS="$S_PASS"; KEY_ALIAS="$S_ALIAS"; KEY_PASS="${S_KPASS:-$S_PASS}"; NEW=0
+          else
+            echo "First Build: generating a NEW keystore"
+            KS_PASS="$(openssl rand -hex 16)"; KEY_PASS="$KS_PASS"; KEY_ALIAS="ft-release"; NEW=1
+            keytool -genkeypair -v -keystore out/release.jks -storetype PKCS12 -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=F T QR, OU=FREE TIME, O=FREE TIME, L=Dhaka, C=BD" >/dev/null
+          fi
+          SHA256="$(keytool -list -v -keystore out/release.jks -storepass "$KS_PASS" -alias "$KEY_ALIAS" | grep 'SHA256:' | head -1 | sed 's/.*SHA256: *//')"
+          {
+            echo "KS_PATH=$GITHUB_WORKSPACE/out/release.jks"
+            echo "KS_ALIAS=$KEY_ALIAS"
+            echo "NEW_KEYSTORE=$NEW"
+            echo "CERT_SHA256=$SHA256"
+          } >> "$GITHUB_ENV"
+          echo "::add-mask::$KS_PASS"
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+          echo "KEY_PASS=$KEY_PASS" >> "$GITHUB_ENV"
+
+      - name: Import project
+        env:
+          GODOT_SCRIPT_ENCRYPTION_KEY: ${{ secrets.SCRIPT_AES256_ENCRYPTION_KEY }}
+        run: |
+          godot --headless --path . --import || true
+          godot --headless --path . --import
+
+      - name: Export signed APK + AAB (encrypted PCK)
+        env:
+          GODOT_SCRIPT_ENCRYPTION_KEY: ${{ secrets.SCRIPT_AES256_ENCRYPTION_KEY }}
+          GODOT_ANDROID_KEYSTORE_RELEASE_PATH: ${{ env.KS_PATH }}
+          GODOT_ANDROID_KEYSTORE_RELEASE_USER: ${{ env.KS_ALIAS }}
+          GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD: ${{ env.KS_PASS }}
+        run: |
+          set -euo pipefail
+          sed -i "s|^version/code=.*|version/code=${VERSION_CODE}|;s|^version/name=.*|version/name=\"${VERSION_NAME}\"|" export_presets.cfg
+          godot --headless --path . --export-release "Android APK" build/app-release.apk
+          godot --headless --path . --export-release "Android AAB" build/app-release.aab
+          ls -la build
+
+      # ---- Checks ----
+      - name: Verify outputs (size, arm64 only, targetSdk, 16 KB, encryption)
+        run: |
+          set -euo pipefail
+          test -s build/app-release.apk || { echo "::error::APK missing"; exit 1; }
+          test -s build/app-release.aab || { echo "::error::AAB missing"; exit 1; }
+          BT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
+          "$BT/aapt2" dump badging build/app-release.apk | grep -E "package:|targetSdkVersion|sdkVersion|native-code|uses-permission" | tee build/badging.txt
+          grep -q "native-code: 'arm64-v8a'" build/badging.txt || { echo "::error::arm64-v8a lib missing"; exit 1; }
+          if grep -E "native-code:.*(armeabi|x86)" build/badging.txt; then echo "::error::non-arm64 ABI present"; exit 1; fi
+          grep -q "targetSdkVersion:'36'" build/badging.txt || { echo "::error::targetSdk is not 36"; exit 1; }
+          grep -q "name='com.ft.create.qr.and.scanning.app'" build/badging.txt || { echo "::error::package id mismatch"; exit 1; }
+          # signature
+          "$BT/apksigner" verify --verbose build/app-release.apk | head -5
+          # 16 KB page size alignment of native libs
+          "$BT/zipalign" -c -P 16 -v 4 build/app-release.apk | tail -3 || echo "::warning::16 KB zipalign check reported a problem"
+          # source-protection check: no plain GDScript in the APK
+          rm -rf build/apkx && mkdir build/apkx && unzip -q build/app-release.apk -d build/apkx
+          if grep -rlaE "extends (Node|Control|RefCounted|VBoxContainer)" build/apkx --include='*' 2>/dev/null | grep -v '\.so$' | head -3 | grep .; then
+            echo "::error::readable GDScript found inside the APK (encryption not applied)"; exit 1
+          fi
+          echo "Encryption check passed (no readable script source)."
+          rm -rf build/apkx
+
+      # ---- The 8-file output ----
+      - name: Write build-summary, guide, credentials
+        run: |
+          set -euo pipefail
+          cp build/app-release.apk out/app-release.apk
+          cp build/app-release.aab out/app-release.aab
+          cp privacy_policy.html out/privacy_policy.html
+          mv out/release.jks "out/ft-qr-release.jks"
+          base64 -w0 out/ft-qr-release.jks > out/keystore-base64.txt
+          {
+            echo "App: $APP_NAME"; echo "Package: $PACKAGE_NAME"
+            echo "Key alias: $KS_ALIAS"; echo "Keystore password: $KS_PASS"; echo "Key password: $KEY_PASS"
+            echo "Certificate SHA-256: $CERT_SHA256"
+            echo ""
+            echo "GitHub Secrets to create for the NEXT builds:"
+            echo "  KEYSTORE_BASE64  = (content of keystore-base64.txt)"
+            echo "  KEYSTORE_PASSWORD = $KS_PASS"
+            echo "  KEY_ALIAS = $KS_ALIAS"
+            echo "  KEY_PASSWORD = $KEY_PASS"
+            echo "  (Google Play App Signing: upload app-release.aab; add this SHA-256 to the app if you sign yourself.)"
+          } > out/keystore-credentials.txt
+          if [ -f ci/keystore-backup-guide.txt ]; then cp ci/keystore-backup-guide.txt out/keystore-backup-guide.txt; else echo "Keep ft-qr-release.jks and keystore-credentials.txt in 2 safe places. Losing them means you cannot update the app." > out/keystore-backup-guide.txt; fi
+          APK_S=$(stat -c%s out/app-release.apk); AAB_S=$(stat -c%s out/app-release.aab)
+          {
+            echo "BUILD SUMMARY - $APP_NAME"
+            echo "Date (UTC): $(date -u +%F' '%T)"
+            echo "Package: $PACKAGE_NAME | versionCode $VERSION_CODE | versionName $VERSION_NAME"
+            echo "Godot: $(godot --version) | custom template: arm64 release, script encryption compiled in"
+            echo "Actual size: APK $(numfmt --to=iec $APK_S) ($APK_S bytes) | AAB $(numfmt --to=iec $AAB_S) ($AAB_S bytes)"
+            echo "Signing certificate SHA-256: $CERT_SHA256"
+            echo "SECURITY_MODE: $SECURITY_MODE"
+            echo "targetSdk 36 | minSdk 24 | ABI: arm64-v8a only"
+            echo ""
+            if [ -f ci/build-summary-static.txt ]; then cat ci/build-summary-static.txt; fi
+            echo ""
+            echo "NOTE: Encryption is a barrier, not impregnable. A determined attacker with device access can still extract the key from the running app."
+          } > out/build-summary.txt
+          ls -la out
+          test "$(ls out | wc -l)" -eq 8 || { echo "::error::output must contain exactly 8 files"; ls out; exit 1; }
+
+      - name: Upload output (private repo, kept 1 day)
+        uses: actions/upload-artifact@v7
+        with:
+          name: FT-QR-build-output
+          path: out/*
+          retention-days: 1
+          if-no-files-found: error

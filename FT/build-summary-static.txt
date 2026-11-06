@@ -1,0 +1,43 @@
+==== VERSION LOCK (script value -> found -> source -> date) ====
+Godot engine        | script: latest stable | found 4.7.2-stable | github.com/godotengine/godot tags | 2026-11
+Android targetSdk   | script: policy        | 36 (required for new apps/updates from 31 Aug 2026) | Play policy | 2026-11
+minSdk              | 24 | Godot 4.7 supported minimum | godot source (export_plugin.cpp) | 2026-11
+compileSdk/platform | 36 | android-36 | Godot gradle config | 2026-11
+Build-tools         | 36.1.0 | sdkmanager | 2026-11
+NDK                 | 29.0.14206865 | Godot 4.7 detect.py requirement | 2026-11
+JDK                 | 17 (Temurin) | Godot gradle template | 2026-11
+AdMob plugin        | Poing Studios godot-admob-plugin 5.1.0 (Next-Gen Ads SDK 1.4.0) | github.com/Poing-Studios | 2026-11
+Actions             | checkout v7, cache v6, setup-java v6, setup-android v4, upload-artifact v7 | git tags | 2026-11
+Architectures       | arm64-v8a only (16 KB page-size ready templates in Godot 4.7)
+
+==== MODULE DECISIONS ====
+A (native AdMob banner + interstitial + UMP consent): ON.  B, C, D: N/A (no login/cloud/online-security backend).
+SECURITY_MODE = TEST -> SECURITY_CHECKS_ENABLED=false (test APK runs anywhere). Module D is OFF, so the PLAY_STORE steps are mostly N/A.
+
+==== SECURITY_MODE (বাংলায় সহজ ভাষায়) ====
+- এই বিল্ড TEST মোডে: অ্যাপে কোনো ইন্টিগ্রিটি/সাইন চেক নেই, যেকোনো ফোনে চলবে।
+- Play Store-এ দেওয়ার আগে SECURITY_MODE=PLAY_STORE দিয়ে আবার বিল্ড করুন এবং Play Console থেকে SHA-256 (App signing) দিন।
+- সোর্স কোড PCK এনক্রিপশন + বাইনারি টোকেনে সুরক্ষিত: এটা বাধা, অভেদ্য নয়।
+
+==== DIFFERENCES vs HTML (1:1 port, nearest equivalent used) ====
+1. Backdrop blur (glass) -> semi-transparent cards + soft shadow + blurred-looking orbs (no real backdrop-filter in Compatibility renderer).
+2. CSS gradients/gloss -> rounded gradient shader (same 3 stops/angles); text gradient on title simplified to accent colour.
+3. Camera: browser getUserMedia -> Godot CameraServer (Camera2 feed), frames decoded by a pure-GDScript QR decoder (HTML used a JS lib). Decode speed/quality may differ on low-end phones.
+4. Torch/flash: not available on the rear camera in Godot (toast shown). Front camera uses a white screen light as in the HTML.
+5. Gallery pick/Save PNG: Android file dialog (SAF) instead of <input type=file>/download link. Share: Android share intent.
+6. Swipe between Create panes (HTML scroll-snap) not ported; Edit/Back button switches panes. Android Back key goes Result -> Edit -> Create tab -> exit.
+7. QR generator: own pure-GDScript encoder (byte mode, same smallest-version/mask rules as qrcode-generator). Verified against OpenCV.
+8. Ads: AppMint browser bridge replaced by native AdMob (banner on top, interstitial pacing kept: 1st QR, then every 3rd). Retry uses exponential back-off 5-60 s.
+9. Fonts: Baloo Da 2 bundled (Bengali shaping needs TextServerAdvanced, default in Godot builds).
+10. Local data: localStorage -> encrypted file user://ft_state.sav.
+11. Hidden diagnostics (tap logo 5x) kept.
+
+==== LIVE RESEARCH REPORT ====
+Versions above were read live (git tags, Godot source, plugin repository) at build-design time; Play target-API policy from Google Play documentation.
+Test AdMob IDs are used unless ADMOB_* secrets are set. Publish only with REAL IDs and after setting up your own AdMob app.
+
+==== NOT VERIFIED (could not be tested in the design sandbox) ====
+- Full GitHub Actions run (custom template scons build, gradle export) - first run may need small fixes.
+- Camera preview rotation/mirror on real devices (use CAMERA_ROTATION_OFFSET_DEG / CAMERA_MIRROR_FRONT in app_config.gd if rotated).
+- Share intent, file dialog filters, Bengali text shaping on device, real ad delivery, UMP consent form.
+- Decryption of the PCK on device (depends on the custom template built with the same key).
