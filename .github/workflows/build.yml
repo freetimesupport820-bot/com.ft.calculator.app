@@ -73,7 +73,7 @@ jobs:
           git clone --depth 1 --branch "$GODOT_TAG" https://github.com/godotengine/godot.git "$RUNNER_TEMP/godot"
           cd "$RUNNER_TEMP/godot"
           scons platform=android target=template_release arch=arm64 \
-            production=yes vulkan=no disable_3d=yes debug_symbols=no \
+            production=yes vulkan=no disable_3d=yes swappy=no debug_symbols=no \
             generate_android_binaries=yes -j"$(nproc)"
           mkdir -p ~/ft-template
           cp bin/android_source.zip ~/ft-template/android_source.zip
